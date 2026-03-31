@@ -15,24 +15,31 @@ const val BULLET_W           = 8f
 const val BULLET_H           = 20f
 const val BULLET_SPEED       = 900f  // px/s
 
-const val WALL_H             = 24f   // height of every wall segment
-
-private fun entitySpeed(round: Int) = 120f + (round - 1) * 30f
-const val BASE_FIRE_INTERVAL = 0.4f
+private fun entitySpeed(round: Int) = 120f + (round - 1) * 15f
+private fun enemyHorizontalSpeed(round: Int) = 30f + (round - 1) * 5f  // Slow horizontal movement
+const val BASE_FIRE_INTERVAL = 0.4f  // Boosted from 0.4f for wave 20 feel
 const val MIN_FIRE_INTERVAL  = 0.08f
-const val BASE_DAMAGE        = 1
-private fun enemyCountForRound(round: Int) = 2 + round
+const val BASE_DAMAGE        = 11     // Boosted from 1 for wave 20 feel
+private fun enemyCountForRound(round: Int) = (2 + round) * 2  // 2x the enemies
 
 // ── Data classes ─────────────────────────────────────────────────────────────
 
 data class Bullet(val x: Float, val y: Float)
+
+enum class EnemyType {
+    NORMAL,   // 1x speed, 1x hp
+    SPRINTER, // 2x speed, 0.5x hp
+    TANK      // 0.5x speed, 2x hp
+}
 
 data class Enemy(
     val id: Int,
     val x: Float,
     val y: Float,
     val hp: Int,
-    val maxHp: Int
+    val maxHp: Int,
+    val type: EnemyType,
+    val horizontalDirection: Float  // -1 for left, 1 for right
 )
 
 data class Upgrade(
@@ -44,23 +51,11 @@ data class Upgrade(
 
 enum class UpgradeType { FIRE_RATE, DAMAGE }
 
-/**
- * One solid segment of a horizontal wall.  A wall "row" is made of 1–2
- * segments separated by a gap wide enough for the player to pass through.
- * [x] / [y] = top-left corner; [w] = width; height is always [WALL_H].
- */
-data class Wall(
-    val id: Int,
-    val x: Float,
-    val y: Float,
-    val w: Float,
-    val hp: Int,
-    val maxHp: Int
-)
-
 // ── Game state ───────────────────────────────────────────────────────────────
 
-class ShooterGameState {
+class ShooterGameState(
+    private val onGameOver: ((score: Int, round: Int) -> Unit)? = null
+) {
 
     // Canvas
     var canvasW by mutableStateOf(0f)
@@ -72,10 +67,9 @@ class ShooterGameState {
     // Projectiles
     var bullets  by mutableStateOf(listOf<Bullet>())
 
-    // Enemies, upgrades & walls
+    // Enemies & upgrades
     var enemies  by mutableStateOf(listOf<Enemy>())
     var upgrades by mutableStateOf(listOf<Upgrade>())
-    var walls    by mutableStateOf(listOf<Wall>())
 
     // Gun stats
     var fireInterval by mutableStateOf(BASE_FIRE_INTERVAL)
@@ -90,7 +84,6 @@ class ShooterGameState {
     // Unique ID counters
     private var nextEnemyId   = 0
     private var nextUpgradeId = 0
-    private var nextWallId    = 0
 
     // Internal fire timer
     private var fireTimer = 0f
@@ -99,6 +92,7 @@ class ShooterGameState {
     var gameOver          by mutableStateOf(false)
     var enemiesDestroyed  by mutableStateOf(0)
     var upgradesCollected by mutableStateOf(0)
+    var isPaused          by mutableStateOf(false)
 
     // ── Initialise ────────────────────────────────────────────────────────────
 
@@ -117,66 +111,60 @@ class ShooterGameState {
         val margin  = ENTITY_W / 2f
         val usableW = canvasW - ENTITY_W
 
+        // Randomize enemy spawn positions with different types
         val newEnemies = List(count) { i ->
-            val fraction = if (count == 1) 0.5f else i.toFloat() / (count - 1).toFloat()
+            val type = when (Random.nextInt(3)) {
+                0 -> EnemyType.NORMAL
+                1 -> EnemyType.SPRINTER
+                else -> EnemyType.TANK
+            }
+            val baseHp = round
+            val hp = when (type) {
+                EnemyType.NORMAL -> baseHp
+                EnemyType.SPRINTER -> (baseHp * 0.5f).toInt().coerceAtLeast(1)
+                EnemyType.TANK -> baseHp * 2
+            }
             Enemy(
                 id    = nextEnemyId++,
-                x     = margin + fraction * usableW,
+                x     = margin + Random.nextFloat() * usableW,
                 y     = -(ENTITY_H + i * (ENTITY_H + 24f)),
-                hp    = round,
-                maxHp = round
+                hp    = hp,
+                maxHp = hp,
+                type  = type,
+                horizontalDirection = if (Random.nextBoolean()) -1f else 1f
             )
         }
 
-        val upgradeX    = Random.nextFloat() * (canvasW - ENTITY_W)
-        val upgradeType = if (Random.nextBoolean()) UpgradeType.FIRE_RATE else UpgradeType.DAMAGE
-        val newUpgrade  = Upgrade(
+        // Guarantee at least one of each upgrade type per round
+        val newUpgrades = mutableListOf<Upgrade>()
+        
+        // Fire rate upgrade
+        newUpgrades.add(Upgrade(
             id   = nextUpgradeId++,
-            x    = upgradeX,
+            x    = Random.nextFloat() * (canvasW - ENTITY_W),
             y    = -(ENTITY_H * 3),
-            type = upgradeType
-        )
-
-        // 1–3 wall rows, each placed above the enemy formation
-        val wallRowCount = Random.nextInt(1, 4)
-        val wallHp       = round * 2
-        val topEnemyY    = -(ENTITY_H + (count - 1) * (ENTITY_H + 24f))
-        val newWalls     = (1..wallRowCount).flatMap { i ->
-            val rowY = topEnemyY - i * (WALL_H + 80f)
-            buildWallRow(rowY, wallHp)
-        }
+            type = UpgradeType.FIRE_RATE
+        ))
+        
+        // Damage upgrade
+        newUpgrades.add(Upgrade(
+            id   = nextUpgradeId++,
+            x    = Random.nextFloat() * (canvasW - ENTITY_W),
+            y    = -(ENTITY_H * 4),
+            type = UpgradeType.DAMAGE
+        ))
 
         enemies      = newEnemies
-        upgrades     = listOf(newUpgrade)
-        walls        = newWalls
+        upgrades     = newUpgrades
         waveActive   = true
         waveStarting = false
         waveTimer    = 0f
     }
 
-    /**
-     * Splits a wall row at [y] into up to two solid segments with a player-
-     * sized gap somewhere in the middle so the level stays navigable.
-     */
-    private fun buildWallRow(y: Float, hp: Int): List<Wall> {
-        val minGap  = PLAYER_WIDTH * 1.6f
-        val maxGap  = canvasW * 0.55f
-        val gapW    = Random.nextFloat() * (maxGap - minGap) + minGap
-        val gapLeft = Random.nextFloat() * (canvasW - gapW)
-        val gapRight = gapLeft + gapW
-
-        val segments = mutableListOf<Wall>()
-        if (gapLeft > 2f)
-            segments += Wall(nextWallId++, x = 0f,      y = y, w = gapLeft,            hp = hp, maxHp = hp)
-        if (gapRight < canvasW - 2f)
-            segments += Wall(nextWallId++, x = gapRight, y = y, w = canvasW - gapRight, hp = hp, maxHp = hp)
-        return segments
-    }
-
     // ── Tick ──────────────────────────────────────────────────────────────────
 
     fun tick(dt: Float) {
-        if (canvasW == 0f || gameOver) return
+        if (canvasW == 0f || gameOver || isPaused) return
 
         // Inter-wave pause
         if (waveStarting) {
@@ -188,7 +176,8 @@ class ShooterGameState {
             return
         }
 
-        val speed = entitySpeed(round)
+        val baseSpeed = entitySpeed(round)
+        val horizontalSpeed = enemyHorizontalSpeed(round)
 
         // ── Fire bullets ──────────────────────────────────────────────────────
         fireTimer += dt
@@ -206,16 +195,36 @@ class ShooterGameState {
             .toMutableList()
 
         var activeEnemies  = enemies
-            .map { it.copy(y = it.y + speed * dt) }
+            .map { enemy ->
+                val speed = when (enemy.type) {
+                    EnemyType.NORMAL -> baseSpeed
+                    EnemyType.SPRINTER -> baseSpeed * 2f
+                    EnemyType.TANK -> baseSpeed * 0.5f
+                }
+                
+                // Calculate new position with horizontal movement
+                var newX = enemy.x + (horizontalSpeed * enemy.horizontalDirection * dt)
+                var newDirection = enemy.horizontalDirection
+                
+                // Bounce off edges
+                if (newX < 0f) {
+                    newX = 0f
+                    newDirection = 1f
+                } else if (newX + ENTITY_W > canvasW) {
+                    newX = canvasW - ENTITY_W
+                    newDirection = -1f
+                }
+                
+                enemy.copy(
+                    x = newX,
+                    y = enemy.y + speed * dt,
+                    horizontalDirection = newDirection
+                )
+            }
             .toMutableList()
 
         var activeUpgrades = upgrades
-            .map { it.copy(y = it.y + speed * dt) }
-            .filter { it.y < canvasH }
-            .toMutableList()
-
-        var activeWalls    = walls
-            .map { it.copy(y = it.y + speed * dt) }
+            .map { it.copy(y = it.y + baseSpeed * dt) }
             .filter { it.y < canvasH }
             .toMutableList()
 
@@ -259,57 +268,31 @@ class ShooterGameState {
         activeBullets.removeAll(bulletsToRemove2)
         activeUpgrades.removeAll { it.id in upgradesHit }
 
-        // ── Bullet × Wall ─────────────────────────────────────────────────────
-        val bulletsToRemove3 = mutableSetOf<Bullet>()
-        val wallDamage       = mutableMapOf<Int, Int>()
-
-        for (bullet in activeBullets) {
-            for (wall in activeWalls) {
-                if (overlaps(bullet.x, bullet.y, BULLET_W, BULLET_H,
-                        wall.x, wall.y, wall.w, WALL_H)) {
-                    bulletsToRemove3 += bullet
-                    wallDamage[wall.id] = (wallDamage[wall.id] ?: 0) + bulletDamage
-                    break
-                }
-            }
-        }
-        activeBullets.removeAll(bulletsToRemove3)
-        activeWalls = activeWalls.map { wall ->
-            wall.copy(hp = wall.hp - (wallDamage[wall.id] ?: 0))
-        }.filter { it.hp > 0 }.toMutableList()
-
         // Commit state
         bullets  = activeBullets
         enemies  = activeEnemies
         upgrades = activeUpgrades
-        walls    = activeWalls
 
         // ── Player collision ──────────────────────────────────────────────────
         val playerTop  = canvasH - PLAYER_HEIGHT - 16f
         val playerLeft = playerX - PLAYER_WIDTH / 2f
 
+        // Only game over if enemy touches player
         for (enemy in activeEnemies) {
             if (overlaps(enemy.x, enemy.y, ENTITY_W, ENTITY_H,
                     playerLeft, playerTop, PLAYER_WIDTH, PLAYER_HEIGHT)) {
-                gameOver = true; return
-            }
-            if (enemy.y + ENTITY_H >= canvasH) {
-                gameOver = true; return
-            }
-        }
-
-        for (wall in activeWalls) {
-            if (overlaps(wall.x, wall.y, wall.w, WALL_H,
-                    playerLeft, playerTop, PLAYER_WIDTH, PLAYER_HEIGHT)) {
-                gameOver = true; return
+                gameOver = true
+                onGameOver?.invoke(enemiesDestroyed * 10, round)
+                return
             }
         }
 
-        // ── Wave clear: enemies AND walls must all be destroyed ───────────────
-        if (waveActive && activeEnemies.isEmpty() && activeWalls.isEmpty()) {
+        // ── Wave clear: only enemies need to be destroyed ─────────────────────
+        if (waveActive && activeEnemies.isEmpty()) {
             waveActive   = false
             waveStarting = true
             waveTimer    = 3f
+            bullets      = listOf()  // Clear bullets for fresh start
         }
     }
 
@@ -331,11 +314,14 @@ class ShooterGameState {
         playerX = (playerX + delta).coerceIn(PLAYER_WIDTH / 2f, canvasW - PLAYER_WIDTH / 2f)
     }
 
+    fun togglePause() {
+        isPaused = !isPaused
+    }
+
     fun reset() {
         bullets  = listOf()
         enemies  = listOf()
         upgrades = listOf()
-        walls    = listOf()
         fireInterval      = BASE_FIRE_INTERVAL
         bulletDamage      = BASE_DAMAGE
         round             = 1
@@ -344,7 +330,6 @@ class ShooterGameState {
         waveTimer         = 0f
         nextEnemyId       = 0
         nextUpgradeId     = 0
-        nextWallId        = 0
         gameOver          = false
         enemiesDestroyed  = 0
         upgradesCollected = 0
